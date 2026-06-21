@@ -111,6 +111,14 @@ impl VectorIndex {
         })
     }
 
+    pub fn is_model_compatible(dir: &Path, model: &str) -> bool {
+        let meta_path = dir.join("meta.json");
+        match load_metadata(&meta_path) {
+            Ok(meta) => meta.model.as_deref() == Some(model),
+            Err(_) => false,
+        }
+    }
+
     pub fn add(&mut self, doc_id: u64, embedding: &[f32]) -> Result<()> {
         if embedding.len() != self.dims {
             return Err(anyhow!(
@@ -420,6 +428,20 @@ mod tests {
             assert_eq!(idx.model(), Some("alpha"));
             assert!(idx.needs_backfill());
         }
+    }
+
+    #[test]
+    fn test_model_compatibility_checks_metadata() {
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).unwrap();
+            idx.add(1, &make_vector(64, 1.0)).unwrap();
+            idx.save().unwrap();
+        }
+
+        assert!(VectorIndex::is_model_compatible(tmp.path(), "alpha"));
+        assert!(!VectorIndex::is_model_compatible(tmp.path(), "beta"));
     }
 
     #[test]
