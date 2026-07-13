@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Search, filter, and retrieve Claude/Codex/Cursor/OpenCode/Pi/Copilot history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
+description: Search, filter, and retrieve Claude/Codex/Cursor/OpenCode/Pi/Copilot/OMP history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
 allowed-tools: Bash(memex:*)
 ---
 
@@ -28,6 +28,8 @@ Use this skill to index local history and retrieve results in a structured, LLM-
   - `--opencode/--no-opencode` to include or skip OpenCode logs
   - `--pi/--no-pi` to include or skip Pi logs
   - `--copilot/--no-copilot` to include or skip GitHub Copilot CLI logs
+  - `--no-omp` to skip OMP logs
+  - `--omp-source <path>` for an explicit OMP sessions directory
   - `--model <minilm|bge|nomic|gemma|potion>` to select embedding model
   - `--root <path>` to change data root (default: `~/.memex`)
 
@@ -61,7 +63,7 @@ Each JSON line includes:
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>` (search inside a transcript)
-- `--source claude|codex|cursor|opencode|pi|copilot`
+- `--source claude|codex|cursor|opencode|pi|copilot|omp`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

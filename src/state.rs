@@ -10,6 +10,18 @@ pub struct FileState {
     pub mtime: i64,
     pub offset: u64,
     pub turn_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_state: Option<SourceFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum SourceFileState {
+    Omp {
+        version: u8,
+        title_slot_bytes: u32,
+        append_checksum: u64,
+    },
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip
@@ -95,5 +107,19 @@ impl IngestState {
         let data = serde_json::to_string_pretty(self)?;
         fs::write(path, data)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_state_without_source_state_remains_readable() {
+        let state: FileState =
+            serde_json::from_str(r#"{"size":10,"mtime":20,"offset":10,"turn_id":1}"#)
+                .expect("read pre-source-state ingest entry");
+
+        assert!(state.source_state.is_none());
     }
 }

@@ -635,7 +635,8 @@ fn resolve_session_cwd_from_parts(
             }
         }
 
-        if source == SourceKind::Pi && value.get("type").and_then(|v| v.as_str()) == Some("session")
+        if matches!(source, SourceKind::Pi | SourceKind::Omp)
+            && value.get("type").and_then(|v| v.as_str()) == Some("session")
         {
             let cwd = value
                 .get("cwd")

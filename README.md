@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, GitHub Copilot CLI, and OMP logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -107,7 +107,7 @@ Then run setup to install the skills:
 memex setup
 ```
 
-Restart Claude, Codex, OpenCode, or Pi after setup.
+Restart Claude, Codex, OpenCode, Pi, or OMP after setup.
 
 ## Quickstart
 
@@ -170,7 +170,7 @@ If you built from source, run setup to install:
 memex setup
 ```
 
-This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents an interactive menu to select which to configure.
+This detects which tools are installed (Claude/Codex/OpenCode/Pi/OMP) and presents an interactive menu to select which to configure.
 ## Search modes
 
 | Need | Command |
@@ -185,7 +185,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|copilot`
+- `--source claude|codex|cursor|opencode|pi|copilot|omp`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -298,6 +298,7 @@ cursor_resume_cmd = "cursor-agent --resume {session_id}"
 opencode_resume_cmd = "opencode resume {session_id}"
 pi_resume_cmd = "pi --session {source_path_shell}"
 # copilot_resume_cmd = "your-copilot-resume-command {session_id}"
+omp_resume_cmd = "omp --resume {session_id}"
 ```
 
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
@@ -312,5 +313,25 @@ new limits to records that are already indexed.
 when `execution_provider = "cuda"`.
 
 Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`.
+
+## OMP transcripts
+
+`memex index` discovers OMP's default session store, named `OMP_PROFILE` (and
+legacy `PI_PROFILE`) stores, `PI_CONFIG_DIR` layouts, and migrated
+`XDG_DATA_HOME/omp` layouts. Use
+`--omp-source <sessions-dir>` for an OMP `--session-dir` or other explicit
+location. OMP and Pi both use the upstream `PI_CODING_AGENT_DIR` environment
+name, so memex does not guess which backend that shared override belongs to.
+For an OMP store selected through that variable, pass its sessions directory
+with `--omp-source` and add `--no-pi` so the same journals are not attributed to
+Pi.
+
+OMP session formats v1, v2, and v3 are supported. The parser accepts v3's
+optional fixed-width title line, preserves v2/v3 entry-tree and tool linkage,
+detects OMP's full-file migration rewrites before incremental indexing, and
+indexes nested subagent sessions recursively. It indexes user/assistant
+text, tool calls and results, custom messages, compactions, and branch summaries;
+thinking and image payloads are excluded. An unknown future session version
+stops with an explicit error rather than being interpreted as v3.
 
 The skill definitions are bundled in `skills/`.

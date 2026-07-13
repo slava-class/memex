@@ -237,15 +237,7 @@ impl Progress {
 }
 
 fn progress_label(source: SourceKind) -> &'static str {
-    match source {
-        SourceKind::Claude => "claude",
-        SourceKind::CodexSession => "codex",
-        SourceKind::CodexHistory => "codex-history",
-        SourceKind::Opencode => "opencode",
-        SourceKind::Cursor => "cursor",
-        SourceKind::Pi => "pi",
-        SourceKind::Copilot => "copilot",
-    }
+    source.progress_label()
 }
 
 fn format_count(value: u64) -> String {

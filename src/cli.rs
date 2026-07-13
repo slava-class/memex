@@ -1,5 +1,7 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
-use crate::config::{Paths, UserConfig, default_claude_source};
+use crate::config::{
+    Paths, UserConfig, default_claude_source, default_omp_agent_root, default_omp_source,
+};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
@@ -8,7 +10,7 @@ use crate::transfer::{
     transfer_session,
 };
 use crate::tui;
-use crate::types::{RecordLinks, SourceFilter};
+use crate::types::{RecordLinks, SourceFilter, SourceKind};
 use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
 use chrono::SecondsFormat;
@@ -26,7 +28,7 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, and Copilot",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, Copilot, and OMP",
     after_help = "\
 QUICK START:
     memex index                     # Index your agent history
@@ -76,6 +78,12 @@ struct IndexArgs {
     /// Skip indexing GitHub Copilot CLI sessions
     #[arg(long = "no-copilot", default_value_t = false)]
     no_copilot: bool,
+    /// Skip indexing OMP sessions
+    #[arg(long = "no-omp", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    omp: bool,
+    /// OMP sessions directory (for --session-dir and other non-default layouts)
+    #[arg(long, value_name = "PATH")]
+    omp_source: Option<PathBuf>,
     /// Generate embeddings for semantic search during indexing
     #[arg(long)]
     embeddings: bool,
@@ -93,7 +101,7 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, Pi, and Copilot conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, Pi, Copilot, and OMP conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -159,7 +167,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, copilot, or omp
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -254,7 +262,7 @@ OUTPUT FIELDS (--fields):
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Install the memex-search skill for Claude, Codex, Opencode, and/or Pi
+    /// Install the memex-search skill for Claude, Codex, Opencode, Pi, and/or OMP
     Setup {
         /// Overwrite existing skills/prompts (useful after memex update)
         #[arg(short, long)]
@@ -579,6 +587,8 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.cursor,
         index.pi && !index.no_pi,
         index.copilot && !index.no_copilot,
+        index.omp,
+        index.omp_source.clone(),
         index.embeddings,
         index.no_embeddings,
         index.model.clone(),
@@ -596,6 +606,8 @@ fn run_index(
     cursor: bool,
     pi: bool,
     copilot: bool,
+    omp: bool,
+    omp_source: Option<PathBuf>,
     embeddings_flag: bool,
     no_embeddings: bool,
     model: Option<String>,
@@ -629,6 +641,11 @@ fn run_index(
         include_cursor: cursor,
         include_pi: pi,
         include_copilot: copilot,
+        include_omp: omp,
+        omp_source: match omp_source {
+            Some(source) => source,
+            None => default_omp_source()?,
+        },
         embeddings,
         backfill_embeddings: false,
         model: model_choice,
@@ -742,17 +759,18 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 
     vector.save()?;
     progress.finish();
-    println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, copilot {})",
-        embedded_total,
-        embedded_counts[crate::types::SourceKind::Claude.idx()],
-        embedded_counts[crate::types::SourceKind::CodexSession.idx()],
-        embedded_counts[crate::types::SourceKind::CodexHistory.idx()],
-        embedded_counts[crate::types::SourceKind::Opencode.idx()],
-        embedded_counts[crate::types::SourceKind::Cursor.idx()],
-        embedded_counts[crate::types::SourceKind::Pi.idx()],
-        embedded_counts[crate::types::SourceKind::Copilot.idx()],
-    );
+    let source_counts = SourceKind::ALL
+        .iter()
+        .map(|source| {
+            format!(
+                "{} {}",
+                source.storage_label(),
+                embedded_counts[source.idx()]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("embedded {embedded_total} vectors ({source_counts})");
 
     std::io::stdout().flush().ok();
     std::process::exit(0);
@@ -801,6 +819,8 @@ fn run_search(
             include_cursor: true,
             include_pi: true,
             include_copilot: true,
+            include_omp: true,
+            omp_source: default_omp_source()?,
             embeddings: embeddings_default,
             backfill_embeddings: false,
             model: model_choice,
@@ -1414,11 +1434,16 @@ fn run_setup(force: bool) -> Result<()> {
     let codex_path = find_in_path("codex");
     let opencode_path = find_in_path("opencode");
     let pi_path = find_in_path("pi");
+    let omp_path = find_in_path("omp");
 
-    if claude_path.is_none() && codex_path.is_none() && opencode_path.is_none() && pi_path.is_none()
+    if claude_path.is_none()
+        && codex_path.is_none()
+        && opencode_path.is_none()
+        && pi_path.is_none()
+        && omp_path.is_none()
     {
         return Err(anyhow!(
-            "Neither claude, codex, opencode, nor pi found in PATH"
+            "None of claude, codex, opencode, pi, or omp were found in PATH"
         ));
     }
 
@@ -1436,6 +1461,9 @@ fn run_setup(force: bool) -> Result<()> {
     }
     if pi_path.is_some() {
         println!("  Pi: memex-search skill");
+    }
+    if omp_path.is_some() {
+        println!("  OMP: memex-search skill");
     }
     if force {
         println!();
@@ -1461,6 +1489,10 @@ fn run_setup(force: bool) -> Result<()> {
     }
     if let Some(path) = &pi_path {
         items.push(("pi", format!("Pi ({})", path.display())));
+        defaults.push(true);
+    }
+    if let Some(path) = &omp_path {
+        items.push(("omp", format!("OMP ({})", path.display())));
         defaults.push(true);
     }
 
@@ -1494,6 +1526,7 @@ fn run_setup(force: bool) -> Result<()> {
         home.join(".codex/skills/memex-search.md"),
         home.join(".local/share/opencode/skills/memex-search.md"),
         pi_agent_root().join("skills/memex-search.md"),
+        default_omp_agent_root()?.join("skills/memex-search.md"),
     ];
     for path in &stale_paths {
         if path.is_dir() {
@@ -1516,6 +1549,7 @@ fn run_setup(force: bool) -> Result<()> {
     let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
     let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
     let pi_skill = include_str!("../skills/pi/memex-search/SKILL.md");
+    let omp_skill = include_str!("../skills/omp/memex-search/SKILL.md");
 
     for index in selected {
         let (tool, _) = &items[index];
@@ -1627,12 +1661,33 @@ fn run_setup(force: bool) -> Result<()> {
                     println!("{verb} Pi skill at {}.", dest.display());
                 }
             }
+            "omp" => {
+                let dest_dir = default_omp_agent_root()?
+                    .join("skills")
+                    .join("memex-search");
+                let dest = dest_dir.join("SKILL.md");
+                if dest.exists() && !force {
+                    println!(
+                        "Skipping OMP skill (already installed at {}). Use --force to overwrite.",
+                        dest.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(&dest_dir)?;
+                    std::fs::write(&dest, omp_skill)?;
+                    let verb = if dest.exists() {
+                        "Updated"
+                    } else {
+                        "Installed"
+                    };
+                    println!("{verb} OMP skill at {}.", dest.display());
+                }
+            }
             _ => {}
         }
     }
 
     println!();
-    println!("Done! Restart Claude Code, Codex, Opencode, or Pi to pick up changes.");
+    println!("Done! Restart Claude Code, Codex, Opencode, Pi, or OMP to pick up changes.");
 
     Ok(())
 }
@@ -1657,14 +1712,12 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
 
     // Get source info from first record
     let record = &records[0];
-    let tool = match record.source {
-        crate::types::SourceKind::Claude => "claude",
-        crate::types::SourceKind::CodexSession | crate::types::SourceKind::CodexHistory => "codex",
-        crate::types::SourceKind::Opencode => "opencode",
-        crate::types::SourceKind::Cursor => "cursor",
-        crate::types::SourceKind::Pi => "pi",
-        crate::types::SourceKind::Copilot => "copilot",
-    };
+    let tool = record.source.agentexport_tool().ok_or_else(|| {
+        anyhow!(
+            "sharing {} sessions is not supported: agentexport currently accepts only claude and codex transcripts",
+            record.source.label()
+        )
+    })?;
     let source_path = &record.source_path;
 
     // Build agentexport command
@@ -2289,6 +2342,13 @@ fn build_index_command_args(
     if !index.copilot || index.no_copilot {
         args.push("--no-copilot".to_string());
     }
+    if !index.omp {
+        args.push("--no-omp".to_string());
+    }
+    if let Some(source) = &index.omp_source {
+        args.push("--omp-source".to_string());
+        args.push(source.to_string_lossy().to_string());
+    }
     if index.embeddings {
         args.push("--embeddings".to_string());
     }
@@ -2398,7 +2458,14 @@ fn service_environment_variables(paths: Option<&Paths>) -> Result<Vec<(String, S
         vars.push(("HF_HOME".to_string(), embed_cache));
     }
 
-    for key in ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"] {
+    for key in [
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "XDG_DATA_HOME",
+    ] {
         if let Some(value) = std::env::var_os(key)
             && !value.is_empty()
         {
@@ -2984,6 +3051,8 @@ mod tests {
             no_opencode: false,
             no_pi: false,
             no_copilot: false,
+            omp: false,
+            omp_source: Some(PathBuf::from("/tmp/omp sessions")),
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -2997,6 +3066,12 @@ mod tests {
         assert!(args.contains(&"--no-cursor".to_string()));
         assert!(args.contains(&"--no-pi".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
+        assert!(args.contains(&"--no-omp".to_string()));
+        assert!(
+            args.windows(2).any(|pair| {
+                pair == ["--omp-source".to_string(), "/tmp/omp sessions".to_string()]
+            })
+        );
     }
 
     #[test]
@@ -3065,6 +3140,7 @@ mod tests {
             "--no-opencode",
             "--no-pi",
             "--no-copilot",
+            "--no-omp",
         ])
         .unwrap();
 
@@ -3075,10 +3151,11 @@ mod tests {
         assert!(index.no_opencode);
         assert!(index.no_pi);
         assert!(index.no_copilot);
+        assert!(!index.omp);
     }
 
     #[test]
-    fn service_environment_variables_include_pi_overrides() {
+    fn service_environment_variables_include_source_overrides() {
         let _guard = env_lock();
         let _env = EnvVarGuard::set_os(&[
             ("PI_CODING_AGENT_DIR", Some("/tmp/pi agent".as_ref())),
@@ -3086,6 +3163,10 @@ mod tests {
                 "PI_CODING_AGENT_SESSION_DIR",
                 Some("/tmp/pi sessions".as_ref()),
             ),
+            ("PI_CONFIG_DIR", Some(".omp-work".as_ref())),
+            ("OMP_PROFILE", Some("work".as_ref())),
+            ("PI_PROFILE", Some("legacy".as_ref())),
+            ("XDG_DATA_HOME", Some("/tmp/xdg-data".as_ref())),
         ]);
 
         let vars = service_environment_variables(None).unwrap();
@@ -3097,6 +3178,22 @@ mod tests {
         assert!(vars.iter().any(|(key, value)| {
             key == "PI_CODING_AGENT_SESSION_DIR" && value == "/tmp/pi sessions"
         }));
+        assert!(
+            vars.iter()
+                .any(|(key, value)| key == "PI_CONFIG_DIR" && value == ".omp-work")
+        );
+        assert!(
+            vars.iter()
+                .any(|(key, value)| key == "OMP_PROFILE" && value == "work")
+        );
+        assert!(
+            vars.iter()
+                .any(|(key, value)| key == "PI_PROFILE" && value == "legacy")
+        );
+        assert!(
+            vars.iter()
+                .any(|(key, value)| key == "XDG_DATA_HOME" && value == "/tmp/xdg-data")
+        );
     }
 
     #[test]

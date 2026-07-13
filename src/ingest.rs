@@ -3,7 +3,7 @@ use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::progress::{Progress, SOURCE_COUNT};
-use crate::state::{FileState, IngestState, ScanCache};
+use crate::state::{FileState, IngestState, ScanCache, SourceFileState};
 use crate::types::{Record, RecordLinks, SourceKind};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -39,6 +39,8 @@ pub struct IngestOptions {
     pub include_cursor: bool,
     pub include_pi: bool,
     pub include_copilot: bool,
+    pub include_omp: bool,
+    pub omp_source: PathBuf,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
@@ -70,6 +72,80 @@ struct FileUpdate {
     path: String,
     state: FileState,
     session_id: Option<String>,
+}
+
+struct FileTaskSet<'a> {
+    state: &'a IngestState,
+    tasks: Vec<FileTask>,
+    files_scanned: usize,
+    files_skipped: usize,
+    total_bytes: u64,
+}
+
+impl<'a> FileTaskSet<'a> {
+    fn new(state: &'a IngestState) -> Self {
+        Self {
+            state,
+            tasks: Vec::new(),
+            files_scanned: 0,
+            files_skipped: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn add_paths<I>(&mut self, paths: I, source: SourceKind) -> Result<()>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        for path in paths {
+            let meta = path.metadata()?;
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            self.files_scanned += 1;
+            self.total_bytes += size;
+
+            let key = path.to_string_lossy().to_string();
+            let previous = self.state.files.get(&key);
+            let source_rewritten = if let Some(previous) = previous {
+                size >= previous.size
+                    && (size != previous.size || mtime != previous.mtime)
+                    && source_file_requires_full_reindex(source, &path, previous)?
+            } else {
+                false
+            };
+            let (offset, turn_id, delete_first, skip) = match previous {
+                None => (0, 0, false, false),
+                Some(previous)
+                    if source_rewritten || size < previous.size || mtime < previous.mtime =>
+                {
+                    (0, 0, true, false)
+                }
+                Some(previous) if size == previous.size && mtime == previous.mtime => {
+                    (previous.offset, previous.turn_id, false, true)
+                }
+                Some(previous) => (previous.offset, previous.turn_id, false, false),
+            };
+            if skip {
+                self.files_skipped += 1;
+                continue;
+            }
+            self.tasks.push(FileTask {
+                path,
+                source,
+                offset,
+                turn_id,
+                size,
+                mtime,
+                delete_first,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -140,315 +216,62 @@ pub fn ingest_all(
     }
     let next_doc_id = Arc::new(AtomicU64::new(state.next_doc_id));
 
-    let mut tasks = Vec::new();
-    let mut files_scanned = 0usize;
-    let mut files_skipped = 0usize;
-    let mut total_bytes = 0u64;
-
+    let mut task_set = FileTaskSet::new(&state);
     if options.claude_source.exists() {
-        let claude_files = collect_claude_files(&options.claude_source, options.include_agents)?;
-        for path in claude_files {
-            let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-                continue;
-            }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Claude,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
-        }
+        task_set.add_paths(
+            collect_claude_files(&options.claude_source, options.include_agents)?,
+            SourceKind::Claude,
+        )?;
     }
 
     let mut session_ids = HashSet::new();
     if options.include_codex {
         let codex_files = collect_codex_session_files()?;
-        for path in codex_files {
-            if let Some(id) = session_id_from_filename(&path) {
+        for path in &codex_files {
+            if let Some(id) = session_id_from_filename(path) {
                 session_ids.insert(id);
             }
-            let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-                continue;
-            }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::CodexSession,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
         }
+        task_set.add_paths(codex_files, SourceKind::CodexSession)?;
     }
 
     if options.include_codex {
         let history_path = codex_history_path();
         if history_path.exists() {
-            let meta = history_path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = history_path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-            } else {
-                tasks.push(FileTask {
-                    path: history_path,
-                    source: SourceKind::CodexHistory,
-                    offset,
-                    turn_id,
-                    size,
-                    mtime,
-                    delete_first,
-                });
-            }
+            task_set.add_paths([history_path], SourceKind::CodexHistory)?;
         }
     }
 
     if options.include_opencode {
-        let opencode_files = collect_opencode_files()?;
-        for path in opencode_files {
-            let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-                continue;
-            }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Opencode,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
-        }
+        task_set.add_paths(collect_opencode_files()?, SourceKind::Opencode)?;
     }
 
     if options.include_cursor {
-        let cursor_files = collect_cursor_files()?;
-        for path in cursor_files {
-            let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-                continue;
-            }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Cursor,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
-        }
+        task_set.add_paths(collect_cursor_files()?, SourceKind::Cursor)?;
     }
 
     if options.include_pi {
-        let pi_files = collect_pi_files()?;
-        for path in pi_files {
-            let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-                continue;
-            }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Pi,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
-        }
+        task_set.add_paths(collect_pi_files()?, SourceKind::Pi)?;
     }
 
     if options.include_copilot {
-        let copilot_files = collect_copilot_files()?;
-        for path in copilot_files {
-            let meta = path.metadata()?;
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            files_scanned += 1;
-            total_bytes += size;
-            let key = path.to_string_lossy().to_string();
-            let prev = state.files.get(&key);
-            let (offset, turn_id, delete_first, skip) = match prev {
-                None => (0, 0, false, false),
-                Some(prev) => {
-                    if size < prev.size || mtime < prev.mtime {
-                        (0, 0, true, false)
-                    } else if size == prev.size && mtime == prev.mtime {
-                        (prev.offset, prev.turn_id, false, true)
-                    } else {
-                        (prev.offset, prev.turn_id, false, false)
-                    }
-                }
-            };
-            if skip {
-                files_skipped += 1;
-                continue;
-            }
-            tasks.push(FileTask {
-                path,
-                source: SourceKind::Copilot,
-                offset,
-                turn_id,
-                size,
-                mtime,
-                delete_first,
-            });
-        }
+        task_set.add_paths(collect_copilot_files()?, SourceKind::Copilot)?;
     }
+
+    if options.include_omp {
+        task_set.add_paths(
+            collect_omp_files_from_root(&options.omp_source)?,
+            SourceKind::Omp,
+        )?;
+    }
+
+    let FileTaskSet {
+        tasks,
+        files_scanned,
+        files_skipped,
+        total_bytes,
+        ..
+    } = task_set;
 
     let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
         opencode_session_links_by_id()
@@ -531,6 +354,9 @@ pub fn ingest_all(
             SourceKind::Pi => parse_pi_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?,
             SourceKind::Copilot => {
                 parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)?
+            }
+            SourceKind::Omp => {
+                parse_omp_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
         }
         Ok(())
@@ -891,6 +717,14 @@ fn collect_pi_files() -> Result<Vec<PathBuf>> {
 }
 
 fn collect_pi_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
+    collect_jsonl_files_from_root(root)
+}
+
+fn collect_omp_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
+    collect_jsonl_files_from_root(root)
+}
+
+fn collect_jsonl_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -905,6 +739,7 @@ fn collect_pi_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
         }
         files.push(path.to_path_buf());
     }
+    files.sort();
     Ok(files)
 }
 
@@ -1489,6 +1324,7 @@ fn parse_claude_file(
         mtime: task.mtime,
         offset: mmap.len() as u64,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: source_path,
@@ -1690,6 +1526,7 @@ fn parse_codex_session(
         mtime: task.mtime,
         offset: mmap.len() as u64,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: source_path,
@@ -1785,6 +1622,7 @@ fn parse_codex_history(
         mtime: task.mtime,
         offset: mmap.len() as u64,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: source_path,
@@ -1910,6 +1748,7 @@ fn parse_opencode_file(
         mtime: task.mtime,
         offset: 0,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: session_dir.to_string_lossy().to_string(),
@@ -2075,6 +1914,7 @@ fn parse_cursor_file(
         mtime: task.mtime,
         offset: mmap.len() as u64,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: source_path,
@@ -2451,6 +2291,7 @@ fn parse_pi_file(
         mtime: task.mtime,
         offset: mmap.len() as u64,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: source_path,
@@ -2458,6 +2299,613 @@ fn parse_pi_file(
         session_id: Some(session_id),
     })?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OmpSessionVersion {
+    V1,
+    V2,
+    V3,
+}
+
+impl OmpSessionVersion {
+    fn has_entry_tree(self) -> bool {
+        matches!(self, Self::V2 | Self::V3)
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+            Self::V3 => 3,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OmpSessionInfo {
+    version: OmpSessionVersion,
+    session_id: String,
+    project: String,
+    parent_session_id: Option<String>,
+    thread_source: Option<String>,
+    conversation_kind: String,
+    title_slot_bytes: usize,
+}
+
+impl OmpSessionInfo {
+    fn source_file_state(&self, mmap: &[u8], offset: u64) -> SourceFileState {
+        SourceFileState::Omp {
+            version: self.version.as_u8(),
+            title_slot_bytes: u32::try_from(self.title_slot_bytes).unwrap_or(u32::MAX),
+            append_checksum: omp_append_checksum(
+                mmap,
+                offset,
+                self.title_slot_bytes.min(mmap.len()),
+            ),
+        }
+    }
+}
+
+struct OmpRecordSink<'a> {
+    tx_record: &'a RecordSender,
+    next_doc_id: &'a AtomicU64,
+    progress: &'a Progress,
+    source_path: &'a str,
+    session: &'a OmpSessionInfo,
+    turn_id: u32,
+}
+
+struct OmpEmission<'a> {
+    ts: u64,
+    role: &'a str,
+    text: String,
+    tool_name: Option<String>,
+    tool_input: Option<String>,
+    tool_output: Option<String>,
+    links: RecordLinks,
+}
+
+impl OmpRecordSink<'_> {
+    fn emit(&mut self, emission: OmpEmission<'_>) -> Result<()> {
+        let record = Record {
+            source: SourceKind::Omp,
+            doc_id: self.next_doc_id.fetch_add(1, Ordering::SeqCst),
+            ts: emission.ts,
+            project: self.session.project.clone(),
+            session_id: self.session.session_id.clone(),
+            turn_id: self.turn_id,
+            role: emission.role.to_string(),
+            text: emission.text,
+            tool_name: emission.tool_name,
+            tool_input: emission.tool_input,
+            tool_output: emission.tool_output,
+            links: emission.links,
+            source_path: self.source_path.to_string(),
+        };
+        self.progress.add_produced(SourceKind::Omp, 1);
+        self.tx_record.send(record)?;
+        self.turn_id += 1;
+        Ok(())
+    }
+}
+
+fn parse_omp_file(
+    task: &FileTask,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let file = File::open(&task.path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let session = read_omp_session_header(&mmap, &task.path)?;
+    let source_path = task.path.to_string_lossy().to_string();
+    let mut sink = OmpRecordSink {
+        tx_record,
+        next_doc_id,
+        progress,
+        source_path: &source_path,
+        session: &session,
+        turn_id: task.turn_id,
+    };
+    let mut start = task.offset as usize;
+    let mut parsed_bytes = 0u64;
+    let mut buf = Vec::new();
+    let mut tool_id_to_name = HashMap::new();
+
+    while start < mmap.len() {
+        let slice = &mmap[start..];
+        let relative_end = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..relative_end];
+        let advanced = relative_end + usize::from(relative_end < slice.len());
+        start += advanced;
+        parsed_bytes += advanced as u64;
+        if parsed_bytes >= 64 * 1024 {
+            progress.add_parsed_bytes(SourceKind::Omp, parsed_bytes);
+            parsed_bytes = 0;
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        buf.clear();
+        buf.extend_from_slice(line);
+        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let entry_type = obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if matches!(entry_type, "title" | "session") {
+            continue;
+        }
+
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(omp_timestamp_millis)
+            .unwrap_or(0);
+        let entry_kind = match entry_type {
+            "branch_summary" => "branch",
+            "compaction" => "compaction",
+            _ => session.conversation_kind.as_str(),
+        };
+        let base_links = omp_record_links(obj, &session, entry_kind);
+
+        if matches!(entry_type, "compaction" | "branch_summary") {
+            let summary = obj
+                .get("summary")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if !summary.is_empty() {
+                sink.emit(OmpEmission {
+                    ts: timestamp,
+                    role: "assistant",
+                    text: format!("{entry_type}: {summary}"),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: base_links,
+                })?;
+            }
+            continue;
+        }
+
+        if entry_type == "custom_message" {
+            let text = omp_content_text(obj.get("content")).trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            let custom_type = obj
+                .get("customType")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let prefix = if custom_type.is_empty() {
+                "custom_message".to_string()
+            } else {
+                format!("custom_message({custom_type})")
+            };
+            let role = if obj.get("attribution").and_then(|value| value.as_str()) == Some("user") {
+                "user"
+            } else {
+                "assistant"
+            };
+            sink.emit(OmpEmission {
+                ts: timestamp,
+                role,
+                text: format!("{prefix}: {text}"),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links: base_links,
+            })?;
+            continue;
+        }
+
+        if entry_type != "message" {
+            continue;
+        }
+        let Some(message) = obj.get("message").and_then(|value| value.as_object()) else {
+            continue;
+        };
+        let timestamp = if timestamp == 0 {
+            message
+                .get("timestamp")
+                .and_then(omp_timestamp_millis)
+                .unwrap_or(0)
+        } else {
+            timestamp
+        };
+        let role = message
+            .get("role")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let mut message_links = base_links;
+        match role {
+            "branchSummary" => {
+                message_links.thread_source = Some("branch".to_string());
+                message_links.conversation_kind = Some("branch".to_string());
+            }
+            "compactionSummary" => {
+                message_links.thread_source = Some("compaction".to_string());
+                message_links.conversation_kind = Some("compaction".to_string());
+            }
+            _ => {}
+        }
+
+        match role {
+            "user" | "assistant" => {
+                let content = message.get("content");
+                if role == "assistant"
+                    && let Some(blocks) = content.and_then(|value| value.as_array())
+                {
+                    for block in blocks {
+                        let Some(block) = block.as_object() else {
+                            continue;
+                        };
+                        if block.get("type").and_then(|value| value.as_str()) != Some("toolCall") {
+                            continue;
+                        }
+                        let tool_name = block
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string);
+                        if let (Some(tool_call_id), Some(tool_name)) = (
+                            block.get("id").and_then(|value| value.as_str()),
+                            tool_name.as_ref(),
+                        ) {
+                            tool_id_to_name.insert(tool_call_id.to_string(), tool_name.clone());
+                        }
+                        let tool_input = block.get("arguments").map(ToString::to_string);
+                        let mut links = message_links.clone();
+                        if let Some(tool_call_id) = block.get("id").and_then(|value| value.as_str())
+                        {
+                            links.event_id = Some(tool_call_id.to_string());
+                            links.parent_event_id = message_links.event_id.clone();
+                        }
+                        sink.emit(OmpEmission {
+                            ts: timestamp,
+                            role: "tool_use",
+                            text: tool_input.clone().unwrap_or_default(),
+                            tool_name,
+                            tool_input,
+                            tool_output: None,
+                            links,
+                        })?;
+                    }
+                }
+
+                let text = omp_content_text(content).trim().to_string();
+                if !text.is_empty() {
+                    sink.emit(OmpEmission {
+                        ts: timestamp,
+                        role,
+                        text,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: message_links,
+                    })?;
+                }
+            }
+            "toolResult" => {
+                let tool_call_id = message
+                    .get("toolCallId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let tool_name = message
+                    .get("toolName")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .or_else(|| tool_id_to_name.get(tool_call_id).cloned());
+                let tool_output = omp_content_text(message.get("content"));
+                if tool_output.trim().is_empty() {
+                    continue;
+                }
+                let mut links = message_links;
+                if !tool_call_id.is_empty() {
+                    links.parent_tool_use_id = Some(tool_call_id.to_string());
+                }
+                sink.emit(OmpEmission {
+                    ts: timestamp,
+                    role: "tool_result",
+                    text: tool_output.clone(),
+                    tool_name,
+                    tool_input: None,
+                    tool_output: Some(tool_output),
+                    links,
+                })?;
+            }
+            "bashExecution" => {
+                if message
+                    .get("excludeFromContext")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let command = message
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = message
+                    .get("output")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = pi_bash_text(
+                    &command,
+                    &output,
+                    message.get("exitCode").and_then(|value| value.as_i64()),
+                );
+                if !text.trim().is_empty() {
+                    sink.emit(OmpEmission {
+                        ts: timestamp,
+                        role: "tool_result",
+                        text,
+                        tool_name: Some("Bash".to_string()),
+                        tool_input: (!command.is_empty()).then_some(command),
+                        tool_output: (!output.is_empty()).then_some(output),
+                        links: message_links,
+                    })?;
+                }
+            }
+            "custom" | "hookMessage" | "branchSummary" | "compactionSummary" => {
+                let text = pi_summary_message_text(message, role);
+                if !text.is_empty() {
+                    sink.emit(OmpEmission {
+                        ts: timestamp,
+                        role: "assistant",
+                        text: format!("{role}: {text}"),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: message_links,
+                    })?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if parsed_bytes > 0 {
+        progress.add_parsed_bytes(SourceKind::Omp, parsed_bytes);
+    }
+    progress.add_files_done(SourceKind::Omp, 1);
+    let state = FileState {
+        size: task.size,
+        mtime: task.mtime,
+        offset: mmap.len() as u64,
+        turn_id: sink.turn_id,
+        source_state: Some(session.source_file_state(&mmap, mmap.len() as u64)),
+    };
+    tx_update.send(FileUpdate {
+        path: source_path,
+        state,
+        session_id: Some(session.session_id),
+    })?;
+    Ok(())
+}
+
+fn read_omp_session_header(mmap: &[u8], path: &Path) -> Result<OmpSessionInfo> {
+    let mut start = 0usize;
+    let mut buf = Vec::new();
+    let mut title_slot_bytes = 0usize;
+    for line_number in 1..=2 {
+        if start >= mmap.len() {
+            break;
+        }
+        let slice = &mmap[start..];
+        let relative_end = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..relative_end];
+        start += relative_end + usize::from(relative_end < slice.len());
+        if line.is_empty() {
+            continue;
+        }
+        buf.clear();
+        buf.extend_from_slice(line);
+        let value: BorrowedValue = simd_json::to_borrowed_value(&mut buf).map_err(|error| {
+            anyhow!(
+                "invalid OMP transcript header at {}:{line_number}: {error}",
+                path.display()
+            )
+        })?;
+        let obj = value.as_object().ok_or_else(|| {
+            anyhow!(
+                "invalid OMP transcript header at {}:{line_number}: expected object",
+                path.display()
+            )
+        })?;
+        let entry_type = obj.get("type").and_then(|value| value.as_str());
+        if entry_type == Some("title") && line_number == 1 {
+            title_slot_bytes = start;
+            continue;
+        }
+        if entry_type != Some("session") {
+            return Err(anyhow!(
+                "invalid OMP transcript header at {}:{line_number}: expected session entry",
+                path.display()
+            ));
+        }
+
+        let version = match obj.get("version") {
+            None => OmpSessionVersion::V1,
+            Some(value) => match value.as_u64() {
+                Some(1) => OmpSessionVersion::V1,
+                Some(2) => OmpSessionVersion::V2,
+                Some(3) => OmpSessionVersion::V3,
+                Some(version) => {
+                    return Err(anyhow!(
+                        "unsupported OMP session version {version} in {}; memex supports versions 1, 2, and 3",
+                        path.display()
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "invalid OMP session version in {}: expected integer",
+                        path.display()
+                    ));
+                }
+            },
+        };
+        let session_id = obj
+            .get("id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("OMP session header missing id in {}", path.display()))?
+            .to_string();
+        let cwd = obj
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("OMP session header missing cwd in {}", path.display()))?;
+        let explicit_parent = obj
+            .get("parentSession")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let nested_parent = omp_nested_parent_session_id(path);
+        let (parent_session_id, thread_source, conversation_kind) =
+            if let Some(parent) = nested_parent {
+                (Some(parent), Some("subagent".to_string()), "subagent")
+            } else if let Some(parent) = explicit_parent {
+                (Some(parent), Some("fork".to_string()), "fork")
+            } else {
+                (None, None, "main")
+            };
+        return Ok(OmpSessionInfo {
+            version,
+            session_id,
+            project: project_from_path(cwd),
+            parent_session_id,
+            thread_source,
+            conversation_kind: conversation_kind.to_string(),
+            title_slot_bytes,
+        });
+    }
+    Err(anyhow!(
+        "OMP transcript {} does not contain a session header in its first two lines",
+        path.display()
+    ))
+}
+
+fn source_file_requires_full_reindex(
+    source: SourceKind,
+    path: &Path,
+    previous: &FileState,
+) -> Result<bool> {
+    if source != SourceKind::Omp {
+        return Ok(false);
+    }
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let session = read_omp_session_header(&mmap, path)?;
+    let current = session.source_file_state(&mmap, previous.offset);
+    Ok(previous.source_state.as_ref() != Some(&current))
+}
+
+fn omp_append_checksum(mmap: &[u8], offset: u64, mutable_prefix_bytes: usize) -> u64 {
+    const WINDOW_BYTES: usize = 64 * 1024;
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let end = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(mmap.len());
+    let start = end
+        .saturating_sub(WINDOW_BYTES)
+        .max(mutable_prefix_bytes.min(end));
+    mmap[start..end]
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |checksum, byte| {
+            (checksum ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+}
+
+fn omp_nested_parent_session_id(path: &Path) -> Option<String> {
+    let parent_dir = path.parent()?;
+    if !parent_dir.with_extension("jsonl").is_file() {
+        return None;
+    }
+    session_id_from_filename(parent_dir)
+}
+
+fn omp_record_links(
+    obj: &simd_json::borrowed::Object,
+    session: &OmpSessionInfo,
+    conversation_kind: &str,
+) -> RecordLinks {
+    let has_entry_tree = session.version.has_entry_tree();
+    RecordLinks {
+        event_id: has_entry_tree.then(|| opt_str(obj, "id")).flatten(),
+        parent_event_id: has_entry_tree.then(|| opt_str(obj, "parentId")).flatten(),
+        logical_parent_event_id: has_entry_tree.then(|| opt_str(obj, "fromId")).flatten(),
+        parent_session_id: session.parent_session_id.clone(),
+        thread_source: if conversation_kind == session.conversation_kind {
+            session.thread_source.clone()
+        } else {
+            Some(conversation_kind.to_string())
+        },
+        conversation_kind: Some(conversation_kind.to_string()),
+        ..RecordLinks::default()
+    }
+}
+
+fn omp_timestamp_millis(value: &BorrowedValue) -> Option<u64> {
+    if let Some(value) = value.as_str() {
+        return parse_iso_millis(value).or_else(|| value.parse::<u64>().ok());
+    }
+    value.as_u64().map(|value| {
+        if value < 10_000_000_000 {
+            value * 1000
+        } else {
+            value
+        }
+    })
+}
+
+fn omp_content_text(content: Option<&BorrowedValue>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for block in blocks {
+        if let Some(text) = block.as_str() {
+            parts.push(text.to_string());
+            continue;
+        }
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        let block_type = block
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if matches!(block_type, "thinking" | "toolCall" | "image") {
+            continue;
+        }
+        if let Some(text) = block
+            .get("text")
+            .or_else(|| block.get("content"))
+            .and_then(|value| value.as_str())
+        {
+            parts.push(text.to_string());
+        }
+    }
+    parts.join("\n")
 }
 
 fn parse_iso_millis(input: &str) -> Option<u64> {
@@ -2756,6 +3204,7 @@ fn parse_copilot_session(
         mtime: task.mtime,
         offset: mmap.len() as u64,
         turn_id,
+        source_state: None,
     };
     tx_update.send(FileUpdate {
         path: source_path,
@@ -3453,6 +3902,8 @@ mod tests {
             include_cursor: false,
             include_pi: false,
             include_copilot: false,
+            include_omp: false,
+            omp_source: PathBuf::from("/does/not/exist"),
             embeddings,
             backfill_embeddings: false,
             model,
@@ -3506,6 +3957,32 @@ mod tests {
             links: RecordLinks::default(),
             source_path: format!("source-{doc_id}.jsonl"),
         }
+    }
+
+    fn parse_omp_records(path: &Path, offset: u64, turn_id: u32) -> Result<Vec<Record>> {
+        let metadata = path.metadata()?;
+        let task = FileTask {
+            path: path.to_path_buf(),
+            source: SourceKind::Omp,
+            offset,
+            turn_id,
+            size: metadata.len(),
+            mtime: 0,
+            delete_first: false,
+        };
+        let (raw_tx_record, rx_record) = unbounded();
+        let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
+        let (tx_update, _rx_update) = unbounded();
+        let next_doc_id = AtomicU64::new(1);
+        let mut byte_totals = [0; SOURCE_COUNT];
+        byte_totals[SourceKind::Omp.idx()] = metadata.len();
+        let mut file_totals = [0; SOURCE_COUNT];
+        file_totals[SourceKind::Omp.idx()] = 1;
+        let progress = Arc::new(Progress::new(byte_totals, file_totals, false));
+
+        parse_omp_file(&task, &tx_record, &tx_update, &next_doc_id, &progress)?;
+        drop(tx_record);
+        Ok(rx_record.try_iter().collect())
     }
 
     #[test]
@@ -3803,6 +4280,8 @@ mod tests {
             include_cursor: false,
             include_pi: false,
             include_copilot: false,
+            include_omp: false,
+            omp_source: tmp.path().join("missing-omp"),
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -4172,6 +4651,8 @@ mod tests {
             include_cursor: false,
             include_pi: true,
             include_copilot: false,
+            include_omp: false,
+            omp_source: tmp.path().join("missing-omp"),
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -4301,6 +4782,290 @@ mod tests {
         assert_eq!(records[0].project, "my-project");
         assert_eq!(records[0].text, "second");
     }
+
+    #[test]
+    fn collect_omp_files_recurses_into_subagent_session_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("-Users-nico-Code-memex");
+        let parent = project.join("20260703T010203Z_11111111-1111-1111-1111-111111111111");
+        fs::create_dir_all(&parent).expect("create omp subagent directory");
+        let main = project.join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        let child = parent.join("20260703T010204Z_22222222-2222-2222-2222-222222222222.jsonl");
+        let ignored = parent.join("notes.json");
+        fs::write(&main, "{}\n").expect("write main");
+        fs::write(&child, "{}\n").expect("write child");
+        fs::write(&ignored, "{}\n").expect("write ignored");
+
+        let files = collect_omp_files_from_root(tmp.path()).expect("collect omp files");
+
+        let mut expected = vec![main, child];
+        expected.sort();
+        assert_eq!(files, expected);
+    }
+
+    #[test]
+    fn parse_omp_supports_v1_v2_and_v3_session_contracts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let v1 = tmp.path().join("v1.jsonl");
+        fs::write(
+            &v1,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"v1-session\",\"timestamp\":\"2025-12-20T00:00:00Z\",\"cwd\":\"/tmp/v1-project\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2025-12-20T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"v1 question\"}}\n",
+                "{\"type\":\"compaction\",\"timestamp\":\"2025-12-20T00:00:02Z\",\"summary\":\"v1 summary\",\"firstKeptEntryIndex\":1,\"tokensBefore\":100}\n"
+            ),
+        )
+        .expect("write v1");
+        let v1_records = parse_omp_records(&v1, 0, 0).expect("parse v1");
+        assert_eq!(v1_records.len(), 2);
+        assert_eq!(v1_records[0].text, "v1 question");
+        assert_eq!(v1_records[0].project, "v1-project");
+        assert_eq!(v1_records[0].links.event_id, None);
+        assert_eq!(v1_records[0].links.parent_event_id, None);
+        assert_eq!(v1_records[1].text, "compaction: v1 summary");
+
+        let v2 = tmp.path().join("v2.jsonl");
+        fs::write(
+            &v2,
+            concat!(
+                "{\"type\":\"session\",\"version\":2,\"id\":\"v2-session\",\"timestamp\":\"2026-01-03T00:00:00Z\",\"cwd\":\"/tmp/v2-project\",\"parentSession\":\"v2-parent\"}\n",
+                "{\"type\":\"message\",\"id\":\"u2\",\"parentId\":null,\"timestamp\":\"2026-01-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"v2 question\"}}\n",
+                "{\"type\":\"message\",\"id\":\"h2\",\"parentId\":\"u2\",\"timestamp\":\"2026-01-03T00:00:02Z\",\"message\":{\"role\":\"hookMessage\",\"content\":\"legacy hook context\"}}\n"
+            ),
+        )
+        .expect("write v2");
+        let v2_records = parse_omp_records(&v2, 0, 0).expect("parse v2");
+        assert_eq!(v2_records.len(), 2);
+        assert_eq!(v2_records[1].role, "assistant");
+        assert_eq!(v2_records[1].text, "hookMessage: legacy hook context");
+        assert_eq!(v2_records[1].links.event_id.as_deref(), Some("h2"));
+        assert_eq!(v2_records[1].links.parent_event_id.as_deref(), Some("u2"));
+        assert_eq!(
+            v2_records[1].links.parent_session_id.as_deref(),
+            Some("v2-parent")
+        );
+        assert_eq!(v2_records[1].links.thread_source.as_deref(), Some("fork"));
+        assert_eq!(
+            v2_records[1].links.conversation_kind.as_deref(),
+            Some("fork")
+        );
+
+        let v3 = tmp.path().join("v3.jsonl");
+        fs::write(
+            &v3,
+            concat!(
+                "{\"type\":\"title\",\"v\":1,\"title\":\"OMP fixture\",\"updatedAt\":\"2026-07-03T00:00:00Z\",\"pad\":\"\"}\n",
+                "{\"type\":\"session\",\"version\":3,\"id\":\"v3-session\",\"timestamp\":\"2026-07-03T00:00:00Z\",\"cwd\":\"/tmp/v3-project\"}\n",
+                "{\"type\":\"message\",\"id\":\"u3\",\"parentId\":null,\"timestamp\":\"2026-07-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"v3 question\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"a3\",\"parentId\":\"u3\",\"timestamp\":\"2026-07-03T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"private reasoning\"},{\"type\":\"text\",\"text\":\"v3 answer\"},{\"type\":\"toolCall\",\"id\":\"tc3\",\"name\":\"Read\",\"arguments\":{\"path\":\"README.md\"}}]}}\n",
+                "{\"type\":\"message\",\"id\":\"tr3\",\"parentId\":\"a3\",\"timestamp\":\"2026-07-03T00:00:03Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"tc3\",\"toolName\":\"Read\",\"content\":[{\"type\":\"text\",\"text\":\"file contents\"}]}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"cm3\",\"parentId\":\"tr3\",\"timestamp\":\"2026-07-03T00:00:04Z\",\"customType\":\"steering\",\"content\":\"user steering\",\"display\":true,\"attribution\":\"user\"}\n",
+                "{\"type\":\"compaction\",\"id\":\"c3\",\"parentId\":\"cm3\",\"timestamp\":\"2026-07-03T00:00:05Z\",\"summary\":\"compact summary\",\"firstKeptEntryId\":\"tr3\",\"tokensBefore\":100}\n",
+                "{\"type\":\"branch_summary\",\"id\":\"br3\",\"parentId\":\"u3\",\"timestamp\":\"2026-07-03T00:00:06Z\",\"fromId\":\"c3\",\"summary\":\"branch summary\"}\n"
+            ),
+        )
+        .expect("write v3");
+        let v3_records = parse_omp_records(&v3, 0, 0).expect("parse v3");
+        assert_eq!(v3_records.len(), 7);
+        assert!(
+            v3_records
+                .iter()
+                .all(|record| record.source == SourceKind::Omp)
+        );
+        assert_eq!(v3_records[1].role, "tool_use");
+        assert_eq!(v3_records[1].tool_name.as_deref(), Some("Read"));
+        assert_eq!(v3_records[1].links.event_id.as_deref(), Some("tc3"));
+        assert_eq!(v3_records[1].links.parent_event_id.as_deref(), Some("a3"));
+        assert_eq!(v3_records[2].role, "assistant");
+        assert_eq!(v3_records[2].text, "v3 answer");
+        assert!(!v3_records[2].text.contains("private reasoning"));
+        assert_eq!(v3_records[3].role, "tool_result");
+        assert_eq!(
+            v3_records[3].links.parent_tool_use_id.as_deref(),
+            Some("tc3")
+        );
+        assert_eq!(v3_records[4].role, "user");
+        assert_eq!(
+            v3_records[4].text,
+            "custom_message(steering): user steering"
+        );
+        assert_eq!(
+            v3_records[5].links.conversation_kind.as_deref(),
+            Some("compaction")
+        );
+        assert_eq!(
+            v3_records[6].links.logical_parent_event_id.as_deref(),
+            Some("c3")
+        );
+        assert_eq!(
+            v3_records[6].links.conversation_kind.as_deref(),
+            Some("branch")
+        );
+    }
+
+    #[test]
+    fn parse_omp_incremental_records_reuses_title_slot_session_header() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_file = tmp.path().join("incremental.jsonl");
+        let existing = concat!(
+            "{\"type\":\"title\",\"v\":1,\"title\":\"Incremental\",\"updatedAt\":\"2026-07-03T00:00:00Z\",\"pad\":\"\"}\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"incremental-session\",\"timestamp\":\"2026-07-03T00:00:00Z\",\"cwd\":\"/home/alice/work/keel-project\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-07-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n"
+        );
+        let appended = "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-07-03T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":\"second\"}}\n";
+        fs::write(&session_file, format!("{existing}{appended}")).expect("write fixture");
+
+        let records = parse_omp_records(&session_file, existing.len() as u64, 1)
+            .expect("parse incremental OMP");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_id, "incremental-session");
+        assert_eq!(records[0].project, "keel-project");
+        assert_eq!(records[0].turn_id, 1);
+        assert_eq!(records[0].text, "second");
+    }
+
+    #[test]
+    fn omp_incremental_guard_accepts_append_after_in_place_title_update() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_file = tmp.path().join("append.jsonl");
+        let alpha_title = "{\"type\":\"title\",\"v\":1,\"title\":\"Alpha\",\"updatedAt\":\"2026-07-03T00:00:00Z\",\"pad\":\"\"}\n";
+        let bravo_title = "{\"type\":\"title\",\"v\":1,\"title\":\"Bravo\",\"updatedAt\":\"2026-07-03T00:00:01Z\",\"pad\":\"\"}\n";
+        assert_eq!(alpha_title.len(), bravo_title.len());
+        let body = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"append-session\",\"timestamp\":\"2026-07-03T00:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-07-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n"
+        );
+        let existing = format!("{alpha_title}{body}");
+        fs::write(&session_file, &existing).expect("write existing OMP session");
+        let previous = omp_file_state(&session_file, 1);
+
+        let appended = "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-07-03T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":\"second\"}}\n";
+        fs::write(&session_file, format!("{bravo_title}{body}{appended}"))
+            .expect("update title and append OMP entry");
+
+        let mut state = IngestState::default();
+        state
+            .files
+            .insert(session_file.to_string_lossy().to_string(), previous);
+        let mut tasks = FileTaskSet::new(&state);
+        tasks
+            .add_paths([session_file], SourceKind::Omp)
+            .expect("collect appended OMP session");
+
+        assert_eq!(tasks.tasks.len(), 1);
+        assert_eq!(tasks.tasks[0].offset, existing.len() as u64);
+        assert_eq!(tasks.tasks[0].turn_id, 1);
+        assert!(!tasks.tasks[0].delete_first);
+    }
+
+    #[test]
+    fn omp_incremental_guard_reindexes_upstream_format_rewrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_file = tmp.path().join("migrated.jsonl");
+        let legacy = concat!(
+            "{\"type\":\"session\",\"version\":2,\"id\":\"migrated-session\",\"timestamp\":\"2026-01-03T00:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-01-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n"
+        );
+        fs::write(&session_file, legacy).expect("write legacy OMP session");
+        let previous = omp_file_state(&session_file, 1);
+
+        let migrated = concat!(
+            "{\"type\":\"title\",\"v\":1,\"title\":\"Migrated\",\"updatedAt\":\"2026-07-03T00:00:00Z\",\"pad\":\"\"}\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"migrated-session\",\"timestamp\":\"2026-01-03T00:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-01-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-07-03T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":\"second\"}}\n"
+        );
+        fs::write(&session_file, migrated).expect("rewrite migrated OMP session");
+
+        let mut state = IngestState::default();
+        state
+            .files
+            .insert(session_file.to_string_lossy().to_string(), previous);
+        let mut tasks = FileTaskSet::new(&state);
+        tasks
+            .add_paths([session_file], SourceKind::Omp)
+            .expect("collect migrated OMP session");
+
+        assert_eq!(tasks.tasks.len(), 1);
+        assert_eq!(tasks.tasks[0].offset, 0);
+        assert_eq!(tasks.tasks[0].turn_id, 0);
+        assert!(tasks.tasks[0].delete_first);
+    }
+
+    fn omp_file_state(path: &Path, turn_id: u32) -> FileState {
+        let file = File::open(path).expect("open OMP state fixture");
+        let mmap = unsafe { Mmap::map(&file).expect("map OMP state fixture") };
+        let session = read_omp_session_header(&mmap, path).expect("read OMP state header");
+        FileState {
+            size: mmap.len() as u64,
+            mtime: 0,
+            offset: mmap.len() as u64,
+            turn_id,
+            source_state: Some(session.source_file_state(&mmap, mmap.len() as u64)),
+        }
+    }
+
+    #[test]
+    fn parse_omp_nested_subagent_links_to_parent_session_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_id = "11111111-1111-1111-1111-111111111111";
+        let parent_stem = format!("20260703T010203Z_{parent_id}");
+        let parent_file = tmp.path().join(format!("{parent_stem}.jsonl"));
+        fs::write(
+            &parent_file,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{parent_id}\",\"timestamp\":\"2026-07-03T00:00:00Z\",\"cwd\":\"/tmp/project\"}}\n"
+            ),
+        )
+        .expect("write parent");
+        let child_dir = tmp.path().join(parent_stem);
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let child_file =
+            child_dir.join("20260703T010204Z_22222222-2222-2222-2222-222222222222.jsonl");
+        fs::write(
+            &child_file,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"22222222-2222-2222-2222-222222222222\",\"timestamp\":\"2026-07-03T00:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+                "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-07-03T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"subagent task\"}}\n"
+            ),
+        )
+        .expect("write child");
+
+        let records = parse_omp_records(&child_file, 0, 0).expect("parse child");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some(parent_id)
+        );
+        assert_eq!(records[0].links.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(
+            records[0].links.conversation_kind.as_deref(),
+            Some("subagent")
+        );
+    }
+
+    #[test]
+    fn parse_omp_rejects_unknown_future_session_versions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_file = tmp.path().join("future.jsonl");
+        fs::write(
+            &session_file,
+            "{\"type\":\"session\",\"version\":4,\"id\":\"future\",\"timestamp\":\"2026-07-03T00:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+        )
+        .expect("write future fixture");
+
+        let error = parse_omp_records(&session_file, 0, 0).expect_err("reject future version");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported OMP session version 4")
+        );
+    }
+
     #[test]
     fn collect_copilot_files_finds_session_events() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4358,11 +5123,11 @@ mod tests {
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
-        let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 1],
-            false,
-        ));
+        let mut byte_totals = [0; SOURCE_COUNT];
+        byte_totals[SourceKind::Copilot.idx()] = meta.len();
+        let mut file_totals = [0; SOURCE_COUNT];
+        file_totals[SourceKind::Copilot.idx()] = 1;
+        let progress = Arc::new(Progress::new(byte_totals, file_totals, false));
 
         parse_copilot_session(&task, &tx_record, &tx_update, &next_doc_id, &progress)
             .expect("parse copilot session");

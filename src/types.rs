@@ -11,10 +11,11 @@ pub enum SourceKind {
     Cursor,
     Pi,
     Copilot,
+    Omp,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 7] = [
+    pub const ALL: [SourceKind; 8] = [
         SourceKind::Claude,
         SourceKind::CodexSession,
         SourceKind::CodexHistory,
@@ -22,6 +23,7 @@ impl SourceKind {
         SourceKind::Cursor,
         SourceKind::Pi,
         SourceKind::Copilot,
+        SourceKind::Omp,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -34,6 +36,7 @@ impl SourceKind {
             SourceKind::Cursor => 4,
             SourceKind::Pi => 5,
             SourceKind::Copilot => 6,
+            SourceKind::Omp => 7,
         }
     }
 
@@ -46,6 +49,7 @@ impl SourceKind {
             4 => Some(SourceKind::Cursor),
             5 => Some(SourceKind::Pi),
             6 => Some(SourceKind::Copilot),
+            7 => Some(SourceKind::Omp),
             _ => None,
         }
     }
@@ -58,6 +62,7 @@ impl SourceKind {
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
             SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
         }
     }
 
@@ -70,6 +75,26 @@ impl SourceKind {
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
             SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
+        }
+    }
+
+    pub fn progress_label(self) -> &'static str {
+        match self {
+            SourceKind::CodexSession => "codex",
+            source => source.storage_label(),
+        }
+    }
+
+    pub fn agentexport_tool(self) -> Option<&'static str> {
+        match self {
+            SourceKind::Claude => Some("claude"),
+            SourceKind::CodexSession | SourceKind::CodexHistory => Some("codex"),
+            SourceKind::Opencode
+            | SourceKind::Cursor
+            | SourceKind::Pi
+            | SourceKind::Copilot
+            | SourceKind::Omp => None,
         }
     }
 
@@ -103,6 +128,12 @@ impl SourceKind {
             || path.contains("\\session-state\\")
         {
             SourceKind::Copilot
+        } else if path.contains(".omp/agent/sessions")
+            || path.contains(".omp\\agent\\sessions")
+            || path.contains("omp/agent/sessions")
+            || path.contains("omp\\agent\\sessions")
+        {
+            SourceKind::Omp
         } else {
             SourceKind::Claude
         }
@@ -117,6 +148,7 @@ impl SourceKind {
             "cursor" => Some(SourceKind::Cursor),
             "pi" => Some(SourceKind::Pi),
             "copilot" => Some(SourceKind::Copilot),
+            "omp" => Some(SourceKind::Omp),
             _ => None,
         }
     }
@@ -131,6 +163,7 @@ pub enum SourceFilter {
     Cursor,
     Pi,
     Copilot,
+    Omp,
 }
 
 impl SourceFilter {
@@ -144,6 +177,7 @@ impl SourceFilter {
             SourceFilter::Cursor => source == SourceKind::Cursor,
             SourceFilter::Pi => source == SourceKind::Pi,
             SourceFilter::Copilot => source == SourceKind::Copilot,
+            SourceFilter::Omp => source == SourceKind::Omp,
         }
     }
 
@@ -155,6 +189,7 @@ impl SourceFilter {
             SourceFilter::Cursor => &["cursor"],
             SourceFilter::Pi => &["pi"],
             SourceFilter::Copilot => &["copilot"],
+            SourceFilter::Omp => &["omp"],
         }
     }
 
@@ -166,6 +201,7 @@ impl SourceFilter {
             SourceFilter::Cursor => "cursor",
             SourceFilter::Pi => "pi",
             SourceFilter::Copilot => "copilot",
+            SourceFilter::Omp => "omp",
         }
     }
 }
@@ -273,5 +309,23 @@ mod tests {
 
         assert_eq!(SourceKind::from_path(unix_path), SourceKind::Copilot);
         assert_eq!(SourceKind::from_path(windows_path), SourceKind::Copilot);
+    }
+
+    #[test]
+    fn from_path_recognizes_omp_sessions() {
+        let unix_path = "/Users/nico/.omp/agent/sessions/-Users-nico-Code/20260703_session.jsonl";
+        let windows_path =
+            "C:\\Users\\nico\\.omp\\agent\\sessions\\-Users-nico-Code\\20260703_session.jsonl";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Omp);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Omp);
+    }
+
+    #[test]
+    fn agentexport_capability_is_limited_to_supported_tools() {
+        assert_eq!(SourceKind::Claude.agentexport_tool(), Some("claude"));
+        assert_eq!(SourceKind::CodexSession.agentexport_tool(), Some("codex"));
+        assert_eq!(SourceKind::Omp.agentexport_tool(), None);
+        assert_eq!(SourceKind::Pi.agentexport_tool(), None);
     }
 }

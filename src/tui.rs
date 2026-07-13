@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_path};
-use crate::config::{Paths, UserConfig, default_claude_source};
+use crate::config::{Paths, UserConfig, default_claude_source, default_omp_source};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::types::{Record, SourceFilter, SourceKind};
@@ -250,6 +250,7 @@ enum SourceChoice {
     Cursor,
     Pi,
     Copilot,
+    Omp,
 }
 
 impl SourceChoice {
@@ -261,7 +262,8 @@ impl SourceChoice {
             SourceChoice::Opencode => SourceChoice::Cursor,
             SourceChoice::Cursor => SourceChoice::Pi,
             SourceChoice::Pi => SourceChoice::Copilot,
-            SourceChoice::Copilot => SourceChoice::All,
+            SourceChoice::Copilot => SourceChoice::Omp,
+            SourceChoice::Omp => SourceChoice::All,
         }
     }
 
@@ -274,6 +276,7 @@ impl SourceChoice {
             SourceChoice::Cursor => Some(SourceFilter::Cursor),
             SourceChoice::Pi => Some(SourceFilter::Pi),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
+            SourceChoice::Omp => Some(SourceFilter::Omp),
         }
     }
 
@@ -286,6 +289,7 @@ impl SourceChoice {
             SourceChoice::Cursor => "cursor",
             SourceChoice::Pi => "pi",
             SourceChoice::Copilot => "copilot",
+            SourceChoice::Omp => "omp",
         }
     }
 }
@@ -630,6 +634,8 @@ impl App {
                     include_cursor: true,
                     include_pi: true,
                     include_copilot: true,
+                    include_omp: true,
+                    omp_source: default_omp_source()?,
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
                     model: model_choice,
@@ -1139,6 +1145,11 @@ impl App {
                 .copilot_resume_cmd
                 .clone()
                 .or_else(|| default_resume_template("copilot")),
+            SourceKind::Omp => self
+                .config
+                .omp_resume_cmd
+                .clone()
+                .or_else(|| default_resume_template("omp")),
         };
         let Some(template) = template else {
             self.set_status("resume command not configured in config.toml");
@@ -1161,20 +1172,20 @@ impl App {
             return Ok(());
         };
 
+        let Some(tool) = session.source.agentexport_tool() else {
+            self.set_status(format!(
+                "sharing {} sessions is unsupported (agentexport accepts claude and codex)",
+                session.source.label()
+            ));
+            return Ok(());
+        };
+
         // Check if agentexport is installed
         if find_in_path("agentexport").is_none() {
             self.set_status("agentexport not found (brew install nicosuave/tap/agentexport)");
             return Ok(());
         }
 
-        let tool = match session.source {
-            SourceKind::Claude => "claude",
-            SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
-            SourceKind::Opencode => "opencode",
-            SourceKind::Cursor => "cursor",
-            SourceKind::Pi => "pi",
-            SourceKind::Copilot => "copilot",
-        };
         let source_path = session.source_path.clone();
 
         self.set_status("sharing...");
@@ -2723,6 +2734,7 @@ fn default_resume_template(cmd: &str) -> Option<String> {
             find_in_path("cursor-agent").map(|_| "cursor-agent --resume {session_id}".to_string())
         }
         "pi" => find_in_path("pi").map(|_| "pi --session {source_path_shell}".to_string()),
+        "omp" => find_in_path("omp").map(|_| "omp --resume {session_id}".to_string()),
         _ => None,
     }
 }
@@ -3385,7 +3397,7 @@ fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
             }
         }
 
-        if session.source == SourceKind::Pi
+        if matches!(session.source, SourceKind::Pi | SourceKind::Omp)
             && value.get("type").and_then(|v| v.as_str()) == Some("session")
         {
             let cwd = value

@@ -45,6 +45,121 @@ pub fn default_claude_source() -> PathBuf {
     home.join(".claude").join("projects")
 }
 
+pub fn default_omp_agent_root() -> Result<PathBuf> {
+    let home = BaseDirs::new()
+        .ok_or_else(|| anyhow!("missing home dir"))?
+        .home_dir()
+        .to_path_buf();
+    let config_dir = std::env::var_os("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".omp"));
+    let profile = omp_profile_from_env()?;
+    Ok(omp_profile_root(&home, &config_dir, profile.as_deref()).join("agent"))
+}
+
+pub fn default_omp_source() -> Result<PathBuf> {
+    let home = BaseDirs::new()
+        .ok_or_else(|| anyhow!("missing home dir"))?
+        .home_dir()
+        .to_path_buf();
+    let config_dir = std::env::var_os("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".omp"));
+    let profile = omp_profile_from_env()?;
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    Ok(resolve_omp_sessions_source(
+        &home,
+        &config_dir,
+        profile.as_deref(),
+        xdg_data_home.as_deref(),
+    ))
+}
+
+fn omp_profile_from_env() -> Result<Option<String>> {
+    let (key, raw) = if let Some(raw) = std::env::var_os("OMP_PROFILE") {
+        ("OMP_PROFILE", raw)
+    } else if let Some(raw) = std::env::var_os("PI_PROFILE") {
+        ("PI_PROFILE", raw)
+    } else {
+        return Ok(None);
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow!("{key} is not valid unicode"))?;
+    let profile = raw.trim();
+    if profile.is_empty() || profile == "default" {
+        return Ok(None);
+    }
+    let valid = profile.len() <= 64
+        && profile.bytes().enumerate().all(|(idx, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' => idx > 0,
+            _ => false,
+        })
+        && profile != "."
+        && profile != ".."
+        && !profile.ends_with('.')
+        && !is_windows_reserved_profile(profile);
+    if !valid {
+        return Err(anyhow!(
+            "invalid {key} {profile:?}; expected [a-z0-9][a-z0-9._-]{{0,63}}"
+        ));
+    }
+    Ok(Some(profile.to_string()))
+}
+
+fn is_windows_reserved_profile(profile: &str) -> bool {
+    let basename = profile
+        .split('.')
+        .next()
+        .unwrap_or(profile)
+        .to_ascii_uppercase();
+    matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || basename
+            .strip_prefix("COM")
+            .or_else(|| basename.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_digit())
+}
+
+fn omp_profile_root(
+    home: &std::path::Path,
+    config_dir: &std::path::Path,
+    profile: Option<&str>,
+) -> PathBuf {
+    let root = home.join(config_dir);
+    match profile {
+        Some(profile) => root.join("profiles").join(profile),
+        None => root,
+    }
+}
+
+fn resolve_omp_sessions_source(
+    home: &std::path::Path,
+    config_dir: &std::path::Path,
+    profile: Option<&str>,
+    xdg_data_home: Option<&std::path::Path>,
+) -> PathBuf {
+    if cfg!(any(target_os = "linux", target_os = "macos"))
+        && let Some(xdg_data_home) = xdg_data_home
+    {
+        let app_root = xdg_data_home.join("omp");
+        let xdg_root = match profile {
+            Some(profile) => app_root.join("profiles").join(profile),
+            None => app_root,
+        };
+        if xdg_root.is_dir() {
+            return xdg_root.join("sessions");
+        }
+    }
+    omp_profile_root(home, config_dir, profile)
+        .join("agent")
+        .join("sessions")
+}
+
 pub const DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_INDEXED_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 const MIN_INDEXED_TOOL_CONTENT_BYTES: usize = 1024;
@@ -119,6 +234,8 @@ pub struct UserConfig {
     pub pi_resume_cmd: Option<String>,
     /// Resume command template for GitHub Copilot CLI sessions.
     pub copilot_resume_cmd: Option<String>,
+    /// Resume command template for OMP sessions.
+    pub omp_resume_cmd: Option<String>,
 }
 
 impl UserConfig {
@@ -319,6 +436,77 @@ mod tests {
                 .expect_err("reject too-small limit")
                 .to_string()
                 .contains("max_indexed_tool_output_bytes")
+        );
+    }
+
+    #[test]
+    fn omp_session_source_resolves_default_and_named_profile_layouts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let config_dir = std::path::Path::new(".omp");
+
+        assert_eq!(
+            resolve_omp_sessions_source(&home, config_dir, None, None),
+            home.join(".omp/agent/sessions")
+        );
+        assert_eq!(
+            resolve_omp_sessions_source(&home, config_dir, Some("work"), None),
+            home.join(".omp/profiles/work/agent/sessions")
+        );
+    }
+
+    #[test]
+    fn omp_session_source_matches_migrated_xdg_data_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg-data");
+        std::fs::create_dir_all(xdg.join("omp/profiles/work"))
+            .expect("create migrated OMP profile");
+
+        assert_eq!(
+            resolve_omp_sessions_source(
+                &home,
+                std::path::Path::new(".omp"),
+                Some("work"),
+                Some(&xdg),
+            ),
+            xdg.join("omp/profiles/work/sessions")
+        );
+    }
+
+    #[test]
+    fn omp_profile_validation_matches_current_omp_contract() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[
+            ("OMP_PROFILE", Some("work.tree")),
+            ("PI_PROFILE", Some("ignored")),
+        ]);
+        assert_eq!(
+            omp_profile_from_env()
+                .expect("valid OMP profile")
+                .as_deref(),
+            Some("work.tree")
+        );
+        drop(_env);
+
+        let _env = EnvVarGuard::set(&[
+            ("OMP_PROFILE", None),
+            ("PI_PROFILE", Some("legacy.profile")),
+        ]);
+        assert_eq!(
+            omp_profile_from_env()
+                .expect("valid legacy Pi profile")
+                .as_deref(),
+            Some("legacy.profile")
+        );
+        drop(_env);
+
+        let _env = EnvVarGuard::set(&[("OMP_PROFILE", Some("CON.backup")), ("PI_PROFILE", None)]);
+        assert!(
+            omp_profile_from_env()
+                .expect_err("reject reserved profile")
+                .to_string()
+                .contains("invalid OMP_PROFILE")
         );
     }
 
